@@ -47,4 +47,57 @@
 - Or: Check for workers.dev subdomain during `npm create cloudflare` and prompt setup then
 - Better error message: "Press 'l' for local mode or register workers.dev subdomain"
 
+# Cloudflare Product Insights - Friction Log
 
+## 1. Node.js Version Requirement Too Strict
+**Problem:** Setup failed because Node v18.14.0 didn't meet >=18.14.1 requirement - a 0.0.1 difference. Error buried in stack trace with "EBADENGINE" warnings. No guidance on how to fix.
+
+**Suggestion:** 
+- Clear error at top: "⚠️ Node.js 18.14.1+ required. You have v18.14.0"
+- Include fix: "Run: nvm install 20 or visit nodejs.org"
+- Consider relaxing requirement - 18.14.0 should work
+- Pre-flight version check before installation
+
+**Impact:** Lost 5+ minutes, had to install nvm from scratch
+
+---
+
+## 2. Template Selection Unclear
+**Problem:** 9 template options without descriptions. "API starter (OpenAPI)" vs "Worker only" - which is better for my use case?
+
+**Suggestion:**
+- Add 1-line descriptions: "Worker only - Start from scratch, add products later"
+- "Not sure? Start here →" pointer
+- Link to template comparison guide
+
+---
+
+## 3. D1 Local vs Remote Confusion
+**Problem:** Had to run schema/seed twice (--local and --remote). Not clear why both needed or what difference is.
+
+**Suggestion:**
+- Add `--both` flag to apply to local AND remote
+- Or prompt: "Apply to local and remote? (Y/n)"
+- Explain in docs: "Local = testing, Remote = production"
+
+---
+
+## 4. D1 Execute - No Visual Confirmation
+**Problem:** Minimal feedback after execute commands. No "X rows created" message. Had to query manually to verify.
+
+**Suggestion:**
+- Show: "✅ Created table 'feedback' with 0 rows"
+- After INSERT: "✅ Inserted 15 rows"
+- Add `--verbose` flag
+
+---
+
+## 5. Remote AI Binding Requires workers.dev Setup
+**Problem:** Dev server failed because AI defaulted to remote, requires workers.dev subdomain. Error mid-startup, not during initial setup.
+
+**Suggestion:**
+- Default AI to local for dev (like D1)
+- Check for workers.dev during `npm create cloudflare`
+- Better error: "Press 'l' for local mode or register subdomain"
+
+**Impact:** Confusing - unclear why AI needs remote when D1 works locally
