@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloudflarepm",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-28",
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "feedback-db",
+      "database_id": "bc3ead67-4edf-4b8c-aa1d-bf4435966102"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  }
+}
+
