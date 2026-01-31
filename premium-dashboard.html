@@ -1,438 +1,3 @@
-export interface Env {
-	DB: D1Database;
-	AI: Ai;
-	CACHE: KVNamespace;
-}
-
-interface FeedbackItem {
-	id: number;
-	source: string;
-	content: string;
-	sentiment: number | null;
-	category: string;
-	user_type: string;
-	created_at: string;
-}
-
-interface RiskAnalysis {
-	category: string;
-	user_type: string;
-	complaint_count: number;
-	severity_score: number;
-	sentiment: string;
-	trend: string;
-	velocity: number;
-	sample_feedback: string[];
-	recommendation: string;
-	feedback_ids: number[];
-}
-
-export default {
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		const url = new URL(request.url);
-
-		// CORS headers for API access
-		const corsHeaders = {
-			'Access-Control-Allow-Origin': '*',
-			'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-			'Access-Control-Allow-Headers': 'Content-Type',
-		};
-
-		if (request.method === 'OPTIONS') {
-			return new Response(null, { headers: corsHeaders });
-		}
-
-		// API Routes
-		if (url.pathname === '/api/feedback') {
-			const response = await getFeedback(env);
-			return addCorsHeaders(response, corsHeaders);
-		}
-
-		if (url.pathname === '/api/analyze') {
-			const response = await analyzeSeverity(env);
-			return addCorsHeaders(response, corsHeaders);
-		}
-
-		if (url.pathname === '/api/risks') {
-			const response = await getTopRisks(env);
-			return addCorsHeaders(response, corsHeaders);
-		}
-
-		if (url.pathname === '/api/trends') {
-			const response = await getTrends(env);
-			return addCorsHeaders(response, corsHeaders);
-		}
-
-		if (url.pathname === '/api/resolve' && request.method === 'POST') {
-			const response = await resolveTickets(request, env);
-			return addCorsHeaders(response, corsHeaders);
-		}
-
-		if (url.pathname === '/api/reopen' && request.method === 'POST') {
-			const response = await reopenTickets(request, env);
-			return addCorsHeaders(response, corsHeaders);
-		}
-
-		if (url.pathname === '/api/docs') {
-			return new Response(getOpenAPISpec(), {
-				headers: { 'Content-Type': 'application/json', ...corsHeaders },
-			});
-		}
-
-		// Dashboard
-		return new Response(getDashboardHTML(), {
-			headers: { 'Content-Type': 'text/html' },
-		});
-	},
-};
-
-function addCorsHeaders(response: Response, corsHeaders: any): Response {
-	const newHeaders = new Headers(response.headers);
-	Object.entries(corsHeaders).forEach(([key, value]) => {
-		newHeaders.set(key, value as string);
-	});
-	return new Response(response.body, {
-		status: response.status,
-		statusText: response.statusText,
-		headers: newHeaders,
-	});
-}
-
-async function getFeedback(env: Env) {
-	const { results } = await env.DB.prepare(
-		'SELECT * FROM feedback ORDER BY created_at DESC'
-	).all();
-	return Response.json(results);
-}
-
-async function analyzeSeverity(env: Env): Promise<Response> {
-	// Check cache first (5 min TTL)
-	const cacheKey = 'analysis:latest';
-	const cached = await env.CACHE?.get(cacheKey, 'json');
-	if (cached) {
-		return Response.json({ ...cached, cached: true });
-	}
-
-	const { results } = await env.DB.prepare(`
-		SELECT 
-			category, 
-			user_type,
-			COUNT(*) as count,
-			GROUP_CONCAT(content, ' ||| ') as samples,
-			GROUP_CONCAT(id, ',') as feedback_ids,
-			AVG(julianday('now') - julianday(created_at)) as avg_age_days
-		FROM feedback
-		WHERE status = 'open' OR status IS NULL
-		GROUP BY category, user_type
-	`).all();
-
-	const risks: RiskAnalysis[] = [];
-
-	for (const row of results as any[]) {
-		// Base severity calculation
-		let score = row.count * 10;
-
-		// User type multiplier (enterprise 3x more critical)
-		const userMultiplier = row.user_type === 'enterprise' ? 3.0 : 1.0;
-		score *= userMultiplier;
-
-		// Category multiplier
-		const criticalCategories: Record<string, number> = {
-			'performance': 2.0,
-			'reliability': 1.8,
-			'billing': 1.7,
-			'security': 2.5,
-			'data-loss': 3.0,
-		};
-		score *= criticalCategories[row.category] || 1.0;
-
-		// Recency boost (newer complaints = more urgent)
-		const recencyMultiplier = row.avg_age_days < 1 ? 1.5 : row.avg_age_days < 7 ? 1.2 : 1.0;
-		score *= recencyMultiplier;
-
-		// FAST keyword-based sentiment analysis (no AI calls for speed)
-		let sentiment = 'neutral';
-		const sampleText = row.samples.toLowerCase();
-
-		// Critical keywords (highest priority)
-		const criticalKeywords = ['broken', 'critical', 'urgent', 'failing', 'crash', 'down', 'outage', 'loss', 'security', 'breach'];
-		// Negative keywords
-		const negativeKeywords = ['slow', 'timeout', 'issue', 'problem', 'bug', 'error', 'confusing', 'difficult', 'inconsistent'];
-
-		if (criticalKeywords.some(keyword => sampleText.includes(keyword))) {
-			sentiment = 'critical';
-			score *= 1.4;
-		} else if (negativeKeywords.some(keyword => sampleText.includes(keyword))) {
-			sentiment = 'negative';
-			score *= 1.2;
-		}
-
-		// Trend analysis (velocity)
-		const velocity = row.count / Math.max(row.avg_age_days, 0.5); // complaints per day
-		let trend = 'stable';
-		if (velocity > 5) trend = 'accelerating';
-		else if (velocity > 2) trend = 'rising';
-
-		if (trend === 'accelerating') score *= 1.3;
-
-		// Generate recommendation
-		const recommendation = generateRecommendation(row.category, row.user_type, trend, sentiment);
-
-		risks.push({
-			category: row.category,
-			user_type: row.user_type,
-			complaint_count: row.count,
-			severity_score: Math.round(score),
-			sentiment: sentiment,
-			trend: trend,
-			velocity: Math.round(velocity * 10) / 10,
-			sample_feedback: row.samples.split(' ||| ').slice(0, 3),
-			recommendation: recommendation,
-			feedback_ids: row.feedback_ids.split(',').map((id: string) => parseInt(id)),
-		});
-	}
-
-	risks.sort((a, b) => b.severity_score - a.severity_score);
-
-	const analysis = {
-		analysis_time: new Date().toISOString(),
-		total_risks: risks.length,
-		critical_count: risks.filter(r => r.severity_score > 100).length,
-		top_risks: risks.slice(0, 5),
-		all_risks: risks,
-		cached: false,
-	};
-
-	// Cache for 5 minutes
-	await env.CACHE?.put(cacheKey, JSON.stringify(analysis), { expirationTtl: 300 });
-
-	return Response.json(analysis);
-}
-
-function generateRecommendation(category: string, userType: string, trend: string, sentiment: string): string {
-	const recommendations: Record<string, string> = {
-		'performance_enterprise_accelerating': 'URGENT: Enterprise performance degradation. Escalate to engineering + customer success immediately.',
-		'performance_enterprise_critical': 'CRITICAL: Performance issues affecting enterprise customers. Immediate escalation required.',
-		'billing_enterprise': 'High churn risk. Schedule immediate call with affected accounts. Review billing clarity.',
-		'reliability_enterprise': 'SLA breach risk. Engage SRE team. Prepare incident report.',
-		'reliability_enterprise_critical': 'URGENT: Reliability issues threaten enterprise SLAs. Immediate response required.',
-		'dx_developer': 'Developer experience issue. Prioritize docs update + devrel outreach within 48h.',
-		'documentation_developer': 'Update documentation within 48h. Consider video tutorial or interactive guide.',
-		'support_enterprise': 'Enterprise support response time critical. Review support team capacity and escalation process.',
-	};
-
-	// Try specific combinations first
-	let key = `${category}_${userType}_${trend}`;
-	if (recommendations[key]) return recommendations[key];
-
-	key = `${category}_${userType}_${sentiment}`;
-	if (recommendations[key]) return recommendations[key];
-
-	key = `${category}_${userType}`;
-	if (recommendations[key]) return recommendations[key];
-
-	// Fallback recommendations based on severity
-	if (sentiment === 'critical' && userType === 'enterprise') {
-		return `CRITICAL: ${category} issues affecting enterprise customers. Immediate escalation and communication required.`;
-	}
-	
-	if (trend === 'accelerating') {
-		return `TRENDING UP: ${category} complaints accelerating. Monitor closely and prepare action plan.`;
-	}
-
-	return 'Monitor closely. Consider adding to sprint backlog if pattern continues.';
-}
-
-async function getTopRisks(env: Env) {
-	const analysis = await analyzeSeverity(env);
-	const data = await analysis.json() as any;
-
-	return Response.json({
-		timestamp: new Date().toISOString(),
-		critical_alerts: data.top_risks.slice(0, 3),
-		summary: {
-			total_critical: data.critical_count,
-			recommendation: data.top_risks[0]?.recommendation || 'No critical issues detected',
-		},
-	});
-}
-
-async function getTrends(env: Env) {
-	// Trend analysis over time (if we had time-series data)
-	const { results } = await env.DB.prepare(`
-		SELECT 
-			category,
-			DATE(created_at) as date,
-			COUNT(*) as daily_count
-		FROM feedback
-		GROUP BY category, DATE(created_at)
-		ORDER BY date DESC
-		LIMIT 50
-	`).all();
-
-	return Response.json({
-		trends: results,
-		insight: 'Velocity analysis shows complaint patterns over time',
-	});
-}
-
-async function resolveTickets(request: Request, env: Env) {
-	try {
-		const { ticket_ids, resolution_note } = await request.json() as any;
-		
-		if (!ticket_ids || !Array.isArray(ticket_ids)) {
-			return Response.json({ error: 'ticket_ids array required' }, { status: 400 });
-		}
-		
-		for (const id of ticket_ids) {
-			await env.DB.prepare(`
-				UPDATE feedback 
-				SET status = 'resolved', 
-					resolved_at = datetime('now'),
-					resolution_note = ?
-				WHERE id = ?
-			`).bind(resolution_note || 'Marked as resolved', id).run();
-		}
-		
-		await env.CACHE?.delete('analysis:latest');
-		
-		return Response.json({ 
-			success: true, 
-			resolved_count: ticket_ids.length,
-			message: `Resolved ${ticket_ids.length} ticket(s)`
-		});
-	} catch (e) {
-		return Response.json({ error: String(e) }, { status: 500 });
-	}
-}
-
-async function reopenTickets(request: Request, env: Env) {
-	try {
-		const { ticket_ids } = await request.json() as any;
-		
-		if (!ticket_ids || !Array.isArray(ticket_ids)) {
-			return Response.json({ error: 'ticket_ids array required' }, { status: 400 });
-		}
-		
-		for (const id of ticket_ids) {
-			await env.DB.prepare(`
-				UPDATE feedback 
-				SET status = 'open', 
-					resolved_at = NULL,
-					resolution_note = NULL
-				WHERE id = ?
-			`).bind(id).run();
-		}
-		
-		await env.CACHE?.delete('analysis:latest');
-		
-		return Response.json({ 
-			success: true, 
-			reopened_count: ticket_ids.length,
-			message: `Reopened ${ticket_ids.length} ticket(s)`
-		});
-	} catch (e) {
-		return Response.json({ error: String(e) }, { status: 500 });
-	}
-}
-
-function getOpenAPISpec() {
-	return JSON.stringify({
-		openapi: '3.0.0',
-		info: {
-			title: 'Feedback Signal Detector API',
-			version: '1.0.0',
-			description: 'AI-powered feedback analysis and prioritization system with ticket lifecycle management',
-		},
-		paths: {
-			'/api/feedback': {
-				get: {
-					summary: 'Get all feedback',
-					responses: {
-						'200': { description: 'Array of feedback items' },
-					},
-				},
-			},
-			'/api/analyze': {
-				get: {
-					summary: 'Run severity analysis',
-					description: 'Analyzes open feedback and returns prioritized risks with sentiment detection',
-					responses: {
-						'200': { description: 'Analysis results with severity scores' },
-					},
-				},
-			},
-			'/api/risks': {
-				get: {
-					summary: 'Get top 3 critical risks',
-					responses: {
-						'200': { description: 'Critical alerts requiring immediate attention' },
-					},
-				},
-			},
-			'/api/trends': {
-				get: {
-					summary: 'Get trend analysis',
-					responses: {
-						'200': { description: 'Time-series trend data' },
-					},
-				},
-			},
-			'/api/resolve': {
-				post: {
-					summary: 'Mark tickets as resolved',
-					requestBody: {
-						required: true,
-						content: {
-							'application/json': {
-								schema: {
-									type: 'object',
-									properties: {
-										ticket_ids: {
-											type: 'array',
-											items: { type: 'integer' }
-										},
-										resolution_note: { type: 'string' }
-									}
-								}
-							}
-						}
-					},
-					responses: {
-						'200': { description: 'Tickets resolved successfully' },
-					},
-				},
-			},
-			'/api/reopen': {
-				post: {
-					summary: 'Reopen resolved tickets',
-					requestBody: {
-						required: true,
-						content: {
-							'application/json': {
-								schema: {
-									type: 'object',
-									properties: {
-										ticket_ids: {
-											type: 'array',
-											items: { type: 'integer' }
-										}
-									}
-								}
-							}
-						}
-					},
-					responses: {
-						'200': { description: 'Tickets reopened successfully' },
-					},
-				},
-			},
-		},
-	}, null, 2);
-}
-
-function getDashboardHTML() {
-	return `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1033,6 +598,7 @@ function getDashboardHTML() {
 		let chartInstance = null;
 
 		function showDashboard() {
+			// Could add dashboard view logic here
 			console.log('Dashboard view');
 		}
 
@@ -1041,13 +607,12 @@ function getDashboardHTML() {
 			const statsGrid = document.getElementById('statsGrid');
 			const chartCard = document.getElementById('chartCard');
 			
-			resultsContent.innerHTML = \`
+			resultsContent.innerHTML = `
 				<div class="loading">
 					<div class="loading-spinner"></div>
-					<p style="color: #64748b; font-size: 15px; font-weight: 600;">Analyzing feedback...</p>
-					<p style="color: #94a3b8; font-size: 13px; margin-top: 8px;">Using keyword-based sentiment detection for speed</p>
+					<p style="color: #64748b; font-size: 15px; font-weight: 600;">Analyzing feedback with AI...</p>
 				</div>
-			\`;
+			`;
 			
 			const res = await fetch('/api/analyze');
 			const data = await res.json();
@@ -1065,33 +630,24 @@ function getDashboardHTML() {
 			let html = '<div class="risk-list">';
 			data.top_risks.slice(0, 5).forEach((risk, i) => {
 				const trendIcon = risk.trend === 'accelerating' ? '📈' : risk.trend === 'rising' ? '↗️' : '→';
-				html += \`
+				html += `
 					<div class="risk-item">
 						<div class="risk-header-row">
-							<div class="risk-score">\${risk.severity_score}</div>
+							<div class="risk-score">${risk.severity_score}</div>
 							<div class="risk-tags">
-								<span class="tag critical">\${risk.sentiment}</span>
-								<span class="tag enterprise">\${risk.user_type}</span>
-								<span class="tag">\${trendIcon} \${risk.trend}</span>
+								<span class="tag critical">${risk.sentiment}</span>
+								<span class="tag enterprise">${risk.user_type}</span>
+								<span class="tag">${trendIcon} ${risk.trend}</span>
 							</div>
 						</div>
-						<div class="risk-title">\${risk.category.toUpperCase()}</div>
+						<div class="risk-title">${risk.category.toUpperCase()}</div>
 						<div class="risk-tags">
-							<span class="tag">\${risk.complaint_count} complaints</span>
-							<span class="tag">\${risk.velocity}/day velocity</span>
+							<span class="tag">${risk.complaint_count} complaints</span>
+							<span class="tag">${risk.velocity}/day velocity</span>
 						</div>
-						<div class="risk-sample">"\${risk.sample_feedback[0]}"</div>
-						<div style="margin-top: 12px;">
-							<button 
-								onclick="resolveRisk(\${JSON.stringify(risk.feedback_ids)})" 
-								style="background: #10b981; color: white; padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px; transition: all 0.2s;"
-								onmouseover="this.style.background='#059669'" 
-								onmouseout="this.style.background='#10b981'">
-								✓ Mark Resolved
-							</button>
-						</div>
+						<div class="risk-sample">"${risk.sample_feedback[0]}"</div>
 					</div>
-				\`;
+				`;
 			});
 			html += '</div>';
 			resultsContent.innerHTML = html;
@@ -1100,16 +656,16 @@ function getDashboardHTML() {
 			const topCategories = document.getElementById('topCategories');
 			let catHtml = '';
 			data.all_risks.slice(0, 5).forEach((risk, i) => {
-				catHtml += \`
+				catHtml += `
 					<div class="performer-item">
-						<div class="performer-rank">\${i + 1}</div>
+						<div class="performer-rank">${i + 1}</div>
 						<div class="performer-info">
-							<div class="performer-name">\${risk.category.toUpperCase()}</div>
-							<div class="performer-category">\${risk.user_type} • \${risk.complaint_count} issues</div>
+							<div class="performer-name">${risk.category.toUpperCase()}</div>
+							<div class="performer-category">${risk.user_type} • ${risk.complaint_count} issues</div>
 						</div>
-						<div class="performer-score">\${risk.severity_score}</div>
+						<div class="performer-score">${risk.severity_score}</div>
 					</div>
-				\`;
+				`;
 			});
 			topCategories.innerHTML = catHtml;
 			
@@ -1126,7 +682,7 @@ function getDashboardHTML() {
 			chartInstance = new Chart(ctx, {
 				type: 'bar',
 				data: {
-					labels: risks.map(r => \`\${r.category}\`),
+					labels: risks.map(r => `${r.category}`),
 					datasets: [{
 						label: 'Severity Score',
 						data: risks.map(r => r.severity_score),
@@ -1178,17 +734,17 @@ function getDashboardHTML() {
 			let html = '<h3 style="margin-bottom: 20px; font-size: 20px;">All Feedback (' + data.length + ' items)</h3>';
 			html += '<div style="max-height: 600px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px;">';
 			data.forEach(f => {
-				html += \`
+				html += `
 					<div style="padding: 16px; background: #f8fafc; border-radius: 10px; border-left: 3px solid #667eea;">
 						<div style="display: flex; gap: 8px; margin-bottom: 8px;">
-							<span class="tag">\${f.source}</span>
-							<span class="tag">\${f.category}</span>
-							<span class="tag">\${f.user_type}</span>
+							<span class="tag">${f.source}</span>
+							<span class="tag">${f.category}</span>
+							<span class="tag">${f.user_type}</span>
 						</div>
-						<div style="color: #1e293b; font-size: 14px; line-height: 1.6;">\${f.content}</div>
-						<div style="margin-top: 8px; font-size: 12px; color: #94a3b8;">\${new Date(f.created_at).toLocaleString()}</div>
+						<div style="color: #1e293b; font-size: 14px; line-height: 1.6;">${f.content}</div>
+						<div style="margin-top: 8px; font-size: 12px; color: #94a3b8;">${new Date(f.created_at).toLocaleString()}</div>
 					</div>
-				\`;
+				`;
 			});
 			html += '</div>';
 			resultsContent.innerHTML = html;
@@ -1201,80 +757,40 @@ function getDashboardHTML() {
 			const res = await fetch('/api/risks');
 			const data = await res.json();
 			
-			let html = \`
+			let html = `
 				<div style="background: #fef2f2; border: 2px solid #fecaca; border-radius: 12px; padding: 24px; margin-bottom: 20px;">
 					<h3 style="color: #991b1b; font-size: 20px; margin-bottom: 12px;">🚨 Critical Alerts</h3>
-					<p style="color: #7f1d1d; font-size: 15px; font-weight: 600;">\${data.summary.total_critical} critical issues detected</p>
+					<p style="color: #7f1d1d; font-size: 15px; font-weight: 600;">${data.summary.total_critical} critical issues detected</p>
 					<div style="background: white; padding: 16px; border-radius: 8px; margin-top: 16px;">
 						<strong style="color: #1e293b;">Primary Recommendation:</strong><br>
-						<span style="color: #64748b;">\${data.summary.recommendation}</span>
+						<span style="color: #64748b;">${data.summary.recommendation}</span>
 					</div>
 				</div>
-			\`;
+			`;
 			
 			html += '<div class="risk-list">';
 			data.critical_alerts.forEach((alert, i) => {
-				html += \`
+				html += `
 					<div class="risk-item">
 						<div class="risk-header-row">
-							<div class="risk-score">\${alert.severity_score}</div>
+							<div class="risk-score">${alert.severity_score}</div>
 							<div class="risk-tags">
-								<span class="tag critical">#\${i + 1} Priority</span>
+								<span class="tag critical">#${i + 1} Priority</span>
 							</div>
 						</div>
-						<div class="risk-title">\${alert.category.toUpperCase()} - \${alert.user_type}</div>
+						<div class="risk-title">${alert.category.toUpperCase()} - ${alert.user_type}</div>
 						<div class="risk-tags">
-							<span class="tag">\${alert.complaint_count} complaints</span>
-							<span class="tag">\${alert.trend} trend</span>
+							<span class="tag">${alert.complaint_count} complaints</span>
+							<span class="tag">${alert.trend} trend</span>
 						</div>
-						<div class="risk-sample">"\${alert.sample_feedback[0]}"</div>
+						<div class="risk-sample">"${alert.sample_feedback[0]}"</div>
 					</div>
-				\`;
+				`;
 			});
 			html += '</div>';
 			
 			resultsContent.innerHTML = html;
 		}
-		
-		async function resolveRisk(feedbackIds) {
-			const note = prompt('Resolution note (optional - explain what was done):');
-			if (note === null) return;
-			
-			const loadingMsg = document.createElement('div');
-			loadingMsg.style.cssText = 'position: fixed; top: 20px; right: 20px; background: #10b981; color: white; padding: 16px 24px; border-radius: 8px; font-weight: 600; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 9999;';
-			loadingMsg.textContent = 'Resolving tickets...';
-			document.body.appendChild(loadingMsg);
-			
-			try {
-				const res = await fetch('/api/resolve', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						ticket_ids: feedbackIds,
-						resolution_note: note || 'Marked as resolved by PM'
-					})
-				});
-				
-				const data = await res.json();
-				
-				if (data.success) {
-					loadingMsg.textContent = '✓ Tickets resolved!';
-					loadingMsg.style.background = '#10b981';
-					setTimeout(() => {
-						document.body.removeChild(loadingMsg);
-						runAnalysis();
-					}, 1500);
-				} else {
-					throw new Error(data.error || 'Failed to resolve');
-				}
-			} catch (e) {
-				loadingMsg.textContent = '✗ Error: ' + e.message;
-				loadingMsg.style.background = '#ef4444';
-				setTimeout(() => document.body.removeChild(loadingMsg), 3000);
-			}
-		}
 	</script>
 </body>
 </html>
-	`;
-}
